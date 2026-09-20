@@ -9,10 +9,6 @@ tags: [dashboard, postgres, database, schema, git]
 > as SQL files in a dedicated git repository:
 > `https://github.com/platform-42/dashboard_dbms.git`
 
-> [!warning] Currently private
-> This repo is private at the moment and will become public later.
-> Until then, Gino needs to be added as a collaborator (or given
-> read access some other way) before he can clone it.
 
 ## Clone the repo
 

@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Installing the Dashboard.md",
+                "file": "Using ops_stats from Python.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Installing the Dashboard"
+              "title": "Using ops_stats from Python"
             }
           }
         ]
@@ -206,12 +206,12 @@
   },
   "active": "4e5b4a6d79db4886",
   "lastOpenFiles": [
+    "Welcome.md",
     "Creating the Database Schema.md",
+    "Installing ops_stats.md",
     "Installing the Dashboard.md",
     "Stored Function Design.md",
     "Using ops_stats from Python.md",
-    "Installing ops_stats.md",
-    "Welcome.md",
     "Database Environment Variables.md"
   ]
 }

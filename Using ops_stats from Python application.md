@@ -5,9 +5,10 @@ tags: [dashboard, python, api, ops_stats]
 # Using `ops_stats` from a Python application
 
 > [!info] Purpose
-> This note explains how an application reports **state** (up/down) and
-> **statistics** (events, errors, response time) into the dashboard's
-> Postgres backend, using the `ops_stats` Python package.
+> This note explains how an application reports **state** (up, down or
+> in planned maintenance) and **statistics** (events, errors, response
+> time) into the dashboard's Postgres backend, using the `ops_stats`
+> Python package.
 
 There are exactly two entry points. Everything else — windowing, resets,
 averages, success rate — happens server-side in stored functions. The
@@ -25,7 +26,8 @@ from ops_stats import (
 > [!warning] Before calling either function
 > - The `ops_stats` package is installed in the application's Python
 >   environment (`pip install ops_stats`, or whatever internal index
->   hosts it).
+>   hosts it). Version **5.3.0 or later** is needed for planned
+>   maintenance (`planned_shutdown`).
 > - `ops.customer` already has a row for the customer you're about to
 >   report for (e.g. `BlueFez`, `Platform42`). Reporting for an unknown
 >   customer name raises an error rather than silently creating one —
@@ -90,7 +92,34 @@ update_state(
 |---|---|
 | `customer_name` | Same matching rule as `update_stats`. |
 | `component_type` / `component_name` | Same matching rule as `update_stats`. |
-| `available` | `True` = up, `False` = down. Stored server-side as `'UP'` / `'DOWN'`. |
+| `available` | `True` = up, `False` = down. |
+| `planned_shutdown` | Optional, **keyword-only**, default `False`. Set to `True` together with `available=False` when the component was stopped on purpose (planned maintenance). |
+
+### Resulting state
+
+| Call | Stored state | Dashboard |
+|---|---|---|
+| `available=True` | `'UP'` | Green, up arrow |
+| `available=False` | `'DOWN'` | Red, down arrow — abnormal end (ABEND) |
+| `available=False, planned_shutdown=True` | `'MAINTENANCE'` | Dark gray, pause sign — planned shutdown |
+
+> [!important] DOWN means ABEND unless you say otherwise
+> A component that reports `available=False` without
+> `planned_shutdown=True` is treated as an **abnormal end** and shows
+> red. Only an explicit planned shutdown turns it gray. Gray means the
+> component still belongs to the domain we guard, but nobody needs to
+> react to it.
+
+> [!note] Rules around `planned_shutdown`
+> - It is **keyword-only**: `update_state(..., False, True)` raises a
+>   `TypeError`. Always write `planned_shutdown=True`, so call sites
+>   stay readable.
+> - `available=True, planned_shutdown=True` is meaningless and raises a
+>   `ValueError` in the client. The stored function enforces the same
+>   rule, so callers that bypass the client get the same protection.
+> - Leaving maintenance needs no special call: the next
+>   `update_state(..., available=True)` simply overwrites the state
+>   with `'UP'`.
 
 Unlike stats, state is **not windowed** — there's no history of past
 states, just the current value, overwritten on every call. See
@@ -112,7 +141,7 @@ update_stats(
     total_response_time_ms=100.0,
 )
 
-# BlueFez: orchestrator is down
+# BlueFez: orchestrator is down (abnormal end, shows red)
 update_state(
     customer_name="BlueFez",
     component_type="ORCHESTRATOR",
@@ -140,7 +169,16 @@ update_stats(
     total_response_time_ms=55.0,
 )
 
-# Platform42: orchestrator is up
+# Platform42: orchestrator stopped for planned maintenance (shows gray)
+update_state(
+    customer_name="Platform42",
+    component_type="ORCHESTRATOR",
+    component_name="Orchestrator",
+    available=False,
+    planned_shutdown=True,
+)
+
+# ... maintenance done: orchestrator is up again (shows green)
 update_state(
     customer_name="Platform42",
     component_type="ORCHESTRATOR",
@@ -157,7 +195,8 @@ commits, and closes. That's the right choice for occasional calls (a
 script, a webhook handler).
 
 For a long-running process reporting repeatedly (a daemon, a service
-loop), reuse a single connection instead with `OpsClient`:
+loop), reuse a single connection instead with `OpsClient`. Its
+`update_state` accepts the same `planned_shutdown` keyword:
 
 ```python
 from ops_stats import OpsClient
@@ -176,6 +215,7 @@ with OpsClient() as client:
         component_type="ORCHESTRATOR",
         component_name="Orchestrator",
         available=False,
+        planned_shutdown=True,
     )
 ```
 
@@ -191,6 +231,8 @@ with OpsClient() as client:
   it just calls whichever function applies; the dashboard's read side
   handles components that don't participate in one dimension. See
   [[State vs Stats Architecture]].
+- Clearing a maintenance state — reporting `available=True` again is
+  enough.
 
 ## See also
 

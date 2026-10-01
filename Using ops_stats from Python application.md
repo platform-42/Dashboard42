@@ -8,48 +8,91 @@ tags: [dashboard, python, api, ops_stats]
 > This note explains how an application reports **state** (up, down or
 > in planned maintenance) and **statistics** (events, errors, response
 > time) into the dashboard's Postgres backend, using the `ops_stats`
-> Python package.
+> Python package (version **5.5.0** or later).
 
-There are exactly two entry points. Everything else — windowing, resets,
-averages, success rate — happens server-side in stored functions. The
-application never computes any of that; it just reports raw facts.
+The application only reports raw facts, one transaction at a time.
+Everything else happens elsewhere:
 
-```python
-from ops_stats import (
-    update_stats,
-    update_state,
-)
-```
+- **Aggregation** of transactions into batches happens inside the
+  `OpsClient` object, in memory.
+- **Windowing, averages and success rate** happen server-side, in the
+  stored functions and at dashboard-read time.
+
+There are two ways to call the package:
+
+| Entry point | For | Stats are written |
+|---|---|---|
+| `OpsClient` | Applications and services (the normal case) | Aggregated, once per flush interval |
+| `update_stats()` / `update_state()` | Scripts and occasional calls | Immediately, one write per call |
 
 ## Prerequisites
 
-> [!warning] Before calling either function
-> - The `ops_stats` package is installed in the application's Python
->   environment (`pip install ops_stats`, or whatever internal index
->   hosts it). Version **5.3.0 or later** is needed for planned
->   maintenance (`planned_shutdown`).
-> - `ops.customer` already has a row for the customer you're about to
->   report for (e.g. `BlueFez`, `Platform42`). Reporting for an unknown
->   customer name raises an error rather than silently creating one —
->   see [[Stored Function Design#update_stats]].
-> - `ops.component` already has a row for that customer + component
->   type + component name combination (e.g. `CHANNEL` / `WhatsApp`,
->   `ORCHESTRATOR` / `Orchestrator`). Same rule: unknown components
->   raise, they aren't auto-created.
+> [!warning] Before reporting anything
+> - The `ops_stats` package (5.5.0 or later) is installed in the
+>   application's Python environment.
+> - `ops.customer` already has a row for the customer you report for
+>   (e.g. `BlueFez`, `Platform42`), and `ops.component` has a row for
+>   each customer + component type + component name combination (e.g.
+>   `CHANNEL` / `WhatsApp`, `ORCHESTRATOR` / `Orchestrator`). Unknown
+>   customers and components are never auto-created — see
+>   [[Stored Function Design#update_stats]].
 > - Connection details (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`,
 >   `PGPASSWORD`) are available via environment variables or a `.env`
 >   file. See [[Connecting to the Database]].
 
-## Reporting statistics: `update_stats`
+## Applications: `OpsClient`
+
+Create **one client at startup**, report **every transaction** as it
+happens, and **close** the client when the program stops.
 
 ```python
-update_stats(
-    customer_name="BlueFez",
+from ops_stats import OpsClient
+
+client = OpsClient(flush_interval_s=30)   # once, at startup
+
+# per transaction: 1 event, 0 errors, 12 ms
+client.update_stats("Platform42", "CHANNEL", "WhatsApp", 1, 0, 12)
+
+client.close()                            # writes the last totals
+```
+
+### What happens behind the call
+
+```mermaid
+flowchart LR
+    A["Application<br/>update_stats(..., 1, 0, 12)<br/>per transaction"]
+    B["OpsClient<br/>running totals<br/>per component"]
+    T["Background thread<br/>every flush_interval_s"]
+    DB[("ops.update_stats<br/>5-minute windows")]
+
+    A -- "add (in memory)" --> B
+    T -- "take totals,<br/>reset to zero" --> B
+    T -- "one call per<br/>component" --> DB
+```
+
+1. `update_stats()` adds the numbers to the running totals for that
+   component (customer, type, name) and returns immediately. It never
+   touches the database.
+2. Every `flush_interval_s` seconds a background thread calls the
+   stored function once per component with the totals, and resets the
+   totals to zero.
+3. The stored function adds the batch into the current 5-minute window.
+
+> [!important] Counters never grow without bound
+> Each flush starts a fresh set of totals, and a component that goes
+> quiet disappears from memory until it reports again. Long-running
+> programs can call `update_stats()` indefinitely.
+
+### Parameters
+
+```python
+client.update_stats(
+    customer_name="Platform42",
     component_type="CHANNEL",
     component_name="WhatsApp",
     total_events=1,
-    total_errors=1,
-    total_response_time_ms=100.0,
+    total_errors=0,
+    total_response_time_ms=12.0,
 )
 ```
 
@@ -58,34 +101,127 @@ update_stats(
 | `customer_name` | Must match an existing row in `ops.customer`. |
 | `component_type` | e.g. `"CHANNEL"`, `"ORCHESTRATOR"`. Must match `ops.component`. |
 | `component_name` | e.g. `"WhatsApp"`, `"Instagram"`, `"Orchestrator"`. Must match `ops.component`. |
-| `total_events` | Number of items processed **in this batch** — not a running total. |
-| `total_errors` | Number of those that errored, in the same batch. |
-| `total_response_time_ms` | **Sum** of response times across the batch — not an average. |
+| `total_events` | Events in **this call** — normally `1` (one transaction). |
+| `total_errors` | How many of those failed — normally `0` or `1`. |
+| `total_response_time_ms` | Response time of this transaction; for a multi-event call, the **sum**. |
 
-> [!important] `total_response_time_ms` is a sum, not an average
-> If an app batches 100–1000 events before reporting (the "event
-> hysteresis" pattern), it sums the response times of everything in
-> that batch and passes the sum. The stored function accumulates sums
-> and counts separately, and the dashboard derives the true
-> per-event average as `total_response_time_ms / total_events` at
-> read time. See [[Stats Windowing and Resets]] for why averages can't
-> be accumulated directly.
+> [!note] Batches still work
+> Passing several events in one call (e.g. `10, 1, 140.0`) is fine; the
+> client adds them up the same way. `total_response_time_ms` is always
+> a **sum**, never an average: the dashboard derives the average as
+> `total_response_time_ms / total_events` at read time. See
+> [[Stats Windowing and Resets]] for why averages can't be accumulated.
 
-Each call is a **batch report**, not a snapshot — `update_stats` adds
-these numbers into whatever time window is currently active
-server-side (5 minutes by default). You call it every time you have a
-batch to report; you never need to reset, zero out, or manage windows
-yourself.
+### Choosing `flush_interval_s`
+
+Default: **30 seconds**. Rule: **at most 1/10 of the server's stats
+window** (5 minutes → 30 s).
+
+> [!important] Why not half the window?
+> This is not a sampling problem: no event is ever lost, only delayed.
+> The server stamps a batch with the time it **arrives**, so a
+> transaction that waits in the client across a window boundary is
+> counted in the next window. On average events wait half the
+> interval, so roughly `(flush_interval_s / 2) / window` of them shift:
+>
+> | `flush_interval_s` | Events shifted into the next window |
+> |---|---|
+> | 30 s (1/10) | ~5% |
+> | 150 s (1/2) | ~25% |
+
+### Guarantees
+
+| Situation | Behavior |
+|---|---|
+| Normal call | Returns at once; never waits on the database, never raises database errors. |
+| Database unreachable | Totals are kept and retried at the next flush (summed with new transactions, so memory stays one set per component). A warning is logged. |
+| Batch rejected (e.g. unknown component) | Logged as an error and **dropped** — retrying cannot succeed. Check the log after adding new components. |
+| `close()`, end of `with` block, normal exit | Remaining totals are written. |
+| Hard crash | At most one interval of stats is lost. |
+| Several threads | Safe: threads may share one client. |
+| Forking servers (gunicorn) | Create one client **per worker, after the fork** — the background thread doesn't survive a fork. |
+
+> [!warning] Unknown components are logged, not raised
+> Because aggregated writes happen in the background, a misspelled
+> customer or component name does **not** raise in the application. It
+> shows up as an `ops_stats: dropped stats …` error in the log. Make
+> sure the application's logging is configured so these are visible.
+
+## Full example: a service reporting per transaction
+
+```python
+import logging
+import time
+
+from ops_stats import OpsClient
+
+logging.basicConfig(level=logging.INFO)   # makes ops_stats warnings visible
+
+client = OpsClient(flush_interval_s=30)   # once, at startup
+
+
+def handle_message(message):
+    start = time.perf_counter()
+    errors = 0
+    try:
+        process(message)                  # the actual work
+    except Exception:
+        errors = 1
+        raise
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        client.update_stats("Platform42", "CHANNEL", "WhatsApp", 1, errors, elapsed_ms)
+
+
+try:
+    run_main_loop(handle_message)         # however the program receives work
+finally:
+    client.close()                        # writes the last totals
+```
+
+- The inner `finally` counts every transaction, failed ones included
+  (`errors=1`).
+- The outer `finally` writes the last totals when the program stops.
+- `time.perf_counter()` is the right clock for durations: precise and
+  unaffected by system clock changes.
+- One client serves all components: pass different names, and the
+  client keeps separate totals per component.
+
+For a short program, the `with` form does the same:
+
+```python
+with OpsClient(flush_interval_s=30) as client:
+    for message in messages:
+        ...
+        client.update_stats("Platform42", "CHANNEL", "WhatsApp", 1, 0, 12)
+```
+
+> [!tip] Simulating traffic for a test
+> ```python
+> import random, time
+> from ops_stats import OpsClient
+>
+> with OpsClient(flush_interval_s=30) as client:
+>     for _ in range(10_000):
+>         errors = 1 if random.random() < 0.05 else 0   # 5% errors
+>         response_ms = random.uniform(5, 50)
+>         client.update_stats("Platform42", "CHANNEL", "WhatsApp", 1, errors, response_ms)
+>         time.sleep(0.01)                               # ~100 per second
+> ```
+> The dashboard's success rate should hover around 95%. Add
+> `random.seed(42)` for a repeatable run.
 
 ## Reporting state: `update_state`
 
+State is **not aggregated**: every call is written immediately, on the
+client or as a one-shot function.
+
 ```python
-update_state(
-    customer_name="BlueFez",
-    component_type="ORCHESTRATOR",
-    component_name="Orchestrator",
-    available=False,
-)
+client.update_state("Platform42", "ORCHESTRATOR", "Orchestrator", available=True)
+
+# planned maintenance: shown gray instead of red
+client.update_state("Platform42", "ORCHESTRATOR", "Orchestrator",
+                    available=False, planned_shutdown=True)
 ```
 
 | Parameter | Meaning |
@@ -110,127 +246,58 @@ update_state(
 > component still belongs to the domain we guard, but nobody needs to
 > react to it.
 
-> [!note] Rules around `planned_shutdown`
-> - It is **keyword-only**: `update_state(..., False, True)` raises a
->   `TypeError`. Always write `planned_shutdown=True`, so call sites
->   stay readable.
+> [!note] Rules around `update_state`
+> - `planned_shutdown` is **keyword-only**: `update_state(..., False, True)`
+>   raises a `TypeError`. Always write `planned_shutdown=True`.
 > - `available=True, planned_shutdown=True` is meaningless and raises a
->   `ValueError` in the client. The stored function enforces the same
->   rule, so callers that bypass the client get the same protection.
+>   `ValueError`. The stored function enforces the same rule.
+> - Unlike `update_stats` on a client, `update_state` **raises**
+>   database errors (e.g. unknown component), because it writes
+>   immediately.
 > - Leaving maintenance needs no special call: the next
->   `update_state(..., available=True)` simply overwrites the state
->   with `'UP'`.
+>   `update_state(..., available=True)` overwrites the state with `'UP'`.
 
 Unlike stats, state is **not windowed** — there's no history of past
 states, just the current value, overwritten on every call. See
 [[State vs Stats Architecture]] for why these two are modeled so
 differently.
 
-## Full example (matches the two demo customers)
+## Scripts: one-shot functions
+
+For occasional calls (a script, a cron job, a webhook handler) the
+module-level functions open a connection, write immediately, and close.
+There is **no aggregation**: each call is one database write, and
+database errors are raised.
 
 ```python
 from ops_stats import update_stats, update_state
 
-# BlueFez: one WhatsApp message processed, with an error, 100ms response
-update_stats(
-    customer_name="BlueFez",
-    component_type="CHANNEL",
-    component_name="WhatsApp",
-    total_events=1,
-    total_errors=1,
-    total_response_time_ms=100.0,
-)
+# a batch of 3 WhatsApp messages, 1 error, response times summed
+update_stats("Platform42", "CHANNEL", "WhatsApp", 3, 1, 180.0)
 
-# BlueFez: orchestrator is down (abnormal end, shows red)
-update_state(
-    customer_name="BlueFez",
-    component_type="ORCHESTRATOR",
-    component_name="Orchestrator",
-    available=False,
-)
-
-# Platform42: WhatsApp batch of 3, 1 error, summed 180ms
-update_stats(
-    customer_name="Platform42",
-    component_type="CHANNEL",
-    component_name="WhatsApp",
-    total_events=3,
-    total_errors=1,
-    total_response_time_ms=180.0,
-)
-
-# Platform42: Instagram batch of 4, no errors, summed 55ms
-update_stats(
-    customer_name="Platform42",
-    component_type="CHANNEL",
-    component_name="Instagram",
-    total_events=4,
-    total_errors=0,
-    total_response_time_ms=55.0,
-)
-
-# Platform42: orchestrator stopped for planned maintenance (shows gray)
-update_state(
-    customer_name="Platform42",
-    component_type="ORCHESTRATOR",
-    component_name="Orchestrator",
-    available=False,
-    planned_shutdown=True,
-)
-
-# ... maintenance done: orchestrator is up again (shows green)
-update_state(
-    customer_name="Platform42",
-    component_type="ORCHESTRATOR",
-    component_name="Orchestrator",
-    available=True,
-)
+update_state("Platform42", "ORCHESTRATOR", "Orchestrator",
+             available=False, planned_shutdown=True)
 ```
 
-## One-shot calls vs. a reusable connection
-
-Both `update_stats` and `update_state` shown above are **one-shot
-convenience functions** — each call opens a connection, does its work,
-commits, and closes. That's the right choice for occasional calls (a
-script, a webhook handler).
-
-For a long-running process reporting repeatedly (a daemon, a service
-loop), reuse a single connection instead with `OpsClient`. Its
-`update_state` accepts the same `planned_shutdown` keyword:
-
-```python
-from ops_stats import OpsClient
-
-with OpsClient() as client:
-    client.update_stats(
-        customer_name="BlueFez",
-        component_type="CHANNEL",
-        component_name="WhatsApp",
-        total_events=1,
-        total_errors=1,
-        total_response_time_ms=100.0,
-    )
-    client.update_state(
-        customer_name="BlueFez",
-        component_type="ORCHESTRATOR",
-        component_name="Orchestrator",
-        available=False,
-        planned_shutdown=True,
-    )
-```
+> [!warning] Don't use the one-shot `update_stats` per transaction
+> Every call opens a database connection. For per-transaction
+> reporting in a running program, always use `OpsClient`.
 
 ## What the application never has to think about
 
+- Adding up transactions — `OpsClient` aggregates per component and
+  resets its totals after every flush.
+- When to write to the database — the background thread does it once
+  per interval, and again on close.
 - Which time window a stats report lands in — the stored function
   works that out from `now()`.
-- Resetting counters — there's no reset call; a new window simply
-  starts a fresh row.
+- Resetting server-side counters — there's no reset call; a new window
+  simply starts a fresh row.
 - Computing averages or success rates — those are derived at
-  dashboard-read time, not at report time.
+  dashboard-read time.
 - Whether a component "only" reports state or "only" reports stats —
-  it just calls whichever function applies; the dashboard's read side
-  handles components that don't participate in one dimension. See
-  [[State vs Stats Architecture]].
+  it just calls whichever applies; the dashboard's read side handles
+  the rest. See [[State vs Stats Architecture]].
 - Clearing a maintenance state — reporting `available=True` again is
   enough.
 
@@ -240,3 +307,4 @@ with OpsClient() as client:
 - [[Stats Windowing and Resets]]
 - [[State vs Stats Architecture]]
 - [[Dashboard Architecture Overview]]
+- [[Nginx Reverse Proxy]]

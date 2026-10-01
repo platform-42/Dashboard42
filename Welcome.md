@@ -7,7 +7,8 @@ tags: [dashboard, home, overview]
 > [!info] What this is
 > A lightweight, Geckoboard-style status dashboard for monitoring
 > customer components (channels like WhatsApp/Instagram, the
-> orchestrator, etc.). Green up-arrow = good, red down-arrow = bad.
+> orchestrator, etc.). Green up-arrow = good, red down-arrow = bad,
+> dark gray = planned maintenance (guarded, but no action needed).
 > Built as a proof of concept: no authentication yet, one customer
 > viewed at a time, selected from a dropdown.
 
@@ -23,7 +24,20 @@ Postgres: ops schema
         │
         ▼
 Flask dashboard (Bootstrap cards, 5-minute auto-refresh)
+  runs under gunicorn on 127.0.0.1:8000 (not reachable from outside)
+        ▲
+        │  proxy_pass  <- routing configured in the nginx config
+        │
+nginx (reverse proxy: HTTPS, slow clients, access control)
+        ▲
+        │  HTTPS
+        │
+Browser (workstation / iPhone)
 ```
+
+Visitors never talk to Flask directly: nginx is the only public entry
+point and forwards each request to gunicorn. See
+[[Nginx Reverse Proxy]] for why, and how the routing is set up.
 
 Two independent things are tracked per component:
 
@@ -35,7 +49,7 @@ Two independent things are tracked per component:
 See [[State vs Stats Architecture]] for why these are modeled so
 differently.
 
-## Setup — four steps
+## Setup — six steps
 
 > [!todo] Follow these in order on a fresh machine.
 
@@ -98,6 +112,12 @@ Then run the Flask app and open it in a browser — pick **BlueFez**
 from the dropdown and confirm the WhatsApp stats card and the
 Orchestrator state card both appear.
 
+### 6. Put nginx in front (production)
+
+Run the dashboard under gunicorn and let nginx handle HTTPS and the
+public traffic. Locally on the Mac, open `http://localhost:8080`.
+→ [[Nginx Reverse Proxy]]
+
 ## Reference
 
 - [[Stored Function Design]]
@@ -106,3 +126,4 @@ Orchestrator state card both appear.
 - [[Database Environment Variables]]
 - [[Installing ops_stats]]
 - [[Using ops_stats from Python]]
+- [[Nginx Reverse Proxy]]
